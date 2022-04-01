@@ -22,9 +22,9 @@ import (
 	"fmt"
 	"time"
 
-	"go.opentelemetry.io/otel/metric/number"
-	"go.opentelemetry.io/otel/metric/sdkapi"
 	"go.opentelemetry.io/otel/metric/unit"
+	"go.opentelemetry.io/otel/sdk/metric/number"
+	"go.opentelemetry.io/otel/sdk/metric/sdkapi"
 
 	pkgadapter "knative.dev/eventing/pkg/adapter/v2"
 )

@@ -21,27 +21,29 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"time"
 
 	cloudevents "github.com/cloudevents/sdk-go/v2"
+	"go.opentelemetry.io/otel/exporters/otlp/otlpmetric/otlpmetrichttp"
+	"go.opentelemetry.io/otel/metric/global"
+	"go.opentelemetry.io/otel/sdk/metric"
+	controller "go.opentelemetry.io/otel/sdk/metric/controller/basic"
+	"go.opentelemetry.io/otel/sdk/metric/export/aggregation"
+	processor "go.opentelemetry.io/otel/sdk/metric/processor/basic"
+	"go.opentelemetry.io/otel/sdk/metric/selector/simple"
 	"go.uber.org/zap"
 	kerrors "k8s.io/apimachinery/pkg/util/errors"
 	pkgadapter "knative.dev/eventing/pkg/adapter/v2"
 	"knative.dev/pkg/logging"
 
-	// "This package is no longer supported. Use the go.opentelemetry.io/otel/exporters/otlp/otlpmetric exporter as
-	// a replacement to send data to a collector which can then export with its PRW exporter."
-	"go.opentelemetry.io/contrib/exporters/metric/cortex" //nolint:staticcheck
-
-	"go.opentelemetry.io/otel/attribute"
-	"go.opentelemetry.io/otel/metric/number"
-	"go.opentelemetry.io/otel/metric/sdkapi"
-	controller "go.opentelemetry.io/otel/sdk/metric/controller/basic"
-
 	"github.com/triggermesh/triggermesh/pkg/apis/targets/v1alpha1"
 	targetce "github.com/triggermesh/triggermesh/pkg/targets/adapter/cloudevents"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/sdk/metric/number"
+	"go.opentelemetry.io/otel/sdk/metric/sdkapi"
 )
 
-var _ pkgadapter.Adapter = (*cortexAdapter)(nil)
+var _ pkgadapter.Adapter = (*otlpAdapter)(nil)
 
 // instrumentRef is a reference to an instrument descriptor and its implementation.
 type instrumentRef struct {
@@ -57,10 +59,13 @@ type opentelemetryAdapter struct {
 	logger   *zap.SugaredLogger
 }
 
-type cortexAdapter struct {
+type otlpAdapter struct {
 	opentelemetryAdapter
 
-	cortexConfig *cortex.Config
+	Endpoint      string
+	BearerToken   string
+	RemoteTimeout time.Duration
+	PushInterval  time.Duration
 }
 
 // NewTarget adapter implementation
@@ -96,19 +101,7 @@ func NewTarget(ctx context.Context, envAcc pkgadapter.EnvConfigAccessor, ceClien
 		instruments[i.Name][i.Instrument] = &instrumentRef{descriptor: i.Descriptor}
 	}
 
-	ccfg := &cortex.Config{
-		Endpoint:      env.CortexEndpoint,
-		BearerToken:   env.CortexBearerToken,
-		RemoteTimeout: env.CortexRemoteTimeout,
-		PushInterval:  env.CortexPushInterval,
-	}
-
-	if err = ccfg.Validate(); err != nil {
-		logger.Panicf("Error validating Cortex configuration: %v", err)
-	}
-
-	return &cortexAdapter{
-		cortexConfig: ccfg,
+	return &otlpAdapter{
 		opentelemetryAdapter: opentelemetryAdapter{
 			instruments: instruments,
 
@@ -116,31 +109,52 @@ func NewTarget(ctx context.Context, envAcc pkgadapter.EnvConfigAccessor, ceClien
 			ceClient: ceClient,
 			logger:   logger,
 		},
+
+		Endpoint:      env.CortexEndpoint,
+		BearerToken:   env.CortexBearerToken,
+		RemoteTimeout: env.CortexRemoteTimeout,
+		PushInterval:  env.CortexPushInterval,
 	}
 }
 
 // Start is a blocking function and will return if an error occurs
 // or the context is cancelled.
-func (a *cortexAdapter) Start(ctx context.Context) error {
-	a.logger.Info("Starting Cortex adapter")
+func (a *otlpAdapter) Start(ctx context.Context) error {
+	a.logger.Info("Starting OTLP Prometheus adapter")
 
-	cortexctl, err := cortex.InstallNewPipeline(
-		*a.cortexConfig,
-		controller.WithCollectPeriod(a.cortexConfig.PushInterval),
-	)
+	otlpExporter, err := otlpmetrichttp.New(ctx,
+		otlpmetrichttp.WithEndpoint(a.Endpoint),
+		otlpmetrichttp.WithInsecure(),
+		otlpmetrichttp.WithTimeout(a.RemoteTimeout))
+
 	if err != nil {
-		return fmt.Errorf("failed to create Cortex controller: %v", err)
+		return fmt.Errorf("failed to create Prometheus Remote Exporter: %v", err)
 	}
 
+	procFactory := processor.NewFactory(
+		simple.NewWithHistogramDistribution(),
+		aggregation.StatelessTemporalitySelector())
+
+	meterController := controller.New(procFactory,
+		controller.WithExporter(otlpExporter),
+		controller.WithCollectPeriod(a.PushInterval))
+
+	// Create a processor instance to register the instruments with the controller
+	accum := metric.NewAccumulator(procFactory.NewCheckpointer().(*processor.Processor))
+
+	global.SetMeterProvider(meterController)
+
 	defer func() {
-		if err := cortexctl.Stop(ctx); err != nil {
+		if err := otlpExporter.Shutdown(ctx); err != nil {
 			// Warning only, this will be most of the time a context
 			// cancellation error, which is not an issue.
-			a.logger.Warnw("Error stopping Cortex adapter", zap.Error(err))
+			a.logger.Warnw("Error stopping OTLP adapter", zap.Error(err))
+		}
+
+		if err := meterController.Stop(ctx); err != nil {
+			a.logger.Warn("Error stopping OTLP adapter", zap.Error(err))
 		}
 	}()
-
-	meter := cortexctl.Meter("TriggerMesh")
 
 	// Iterate over all instruments, create their instances and
 	// store the link back to the instruments map.
@@ -148,7 +162,7 @@ func (a *cortexAdapter) Start(ctx context.Context) error {
 		for kind, i := range kindm {
 
 			if i.descriptor.InstrumentKind().Synchronous() {
-				i.sync, err = meter.MeterImpl().NewSyncInstrument(i.descriptor)
+				i.sync, err = accum.NewSyncInstrument(i.descriptor)
 				if err != nil {
 					return fmt.Errorf("failed to create sync instrument: %v", err)
 				}
@@ -171,12 +185,12 @@ func (a *opentelemetryAdapter) dispatch(ctx context.Context, event cloudevents.E
 		return a.replier.Error(&event, targetce.ErrorCodeEventContext, fmt.Errorf("event type %q is not supported", typ), nil)
 	}
 
-	ms := []Measure{}
+	ms := make([]Measure, 0)
 	if err := event.DataAs(&ms); err != nil {
 		return a.replier.Error(&event, targetce.ErrorCodeRequestParsing, err, nil)
 	}
 
-	errs := []error{}
+	errs := make([]error, 0)
 	for i := range ms {
 		if err := a.processSingleMeasure(ctx, ms[i]); err != nil {
 			errs = append(errs, err)

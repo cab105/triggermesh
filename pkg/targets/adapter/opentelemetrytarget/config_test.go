@@ -22,8 +22,8 @@ import (
 
 	"github.com/kelseyhightower/envconfig"
 	"github.com/stretchr/testify/assert"
-	"go.opentelemetry.io/otel/metric/sdkapi"
 	"go.opentelemetry.io/otel/metric/unit"
+	"go.opentelemetry.io/otel/sdk/metric/sdkapi"
 )
 
 const (
